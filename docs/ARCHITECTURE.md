@@ -53,3 +53,25 @@ OpenCode
 - `tests/auth.test.ts` — shape API key + redact log.
 - `tests/config.test.ts` — merge `opencode.json` idempotent + backup.
 - `tests/handler.test.ts` — handler interceptor (mock provider).
+
+
+## Multi-account rotation
+
+When the user adds more than one account, every `/v1/chat/completions` call goes through `auth/rotator.ts`:
+
+```
+handleChatCompletions
+  └─ generateWithRotation / streamWithRotation
+       └─ pickAccount(store, excludeIds)         # rotation.ts
+       └─ getProvider({ accountId, mode, apiKey })
+            └─ subprocess kiro-cli acp (per accountId, cached, idle-shutdown 5m)
+       └─ run model.doGenerate / doStream
+       └─ on error → classifyKiroError → planCooldown → save store → retry next account
+```
+
+Key invariants:
+
+- `kiro-accounts.json` is the single source of truth for credentials and rotation state.
+- Each accountId owns its own `kiro-cli acp` subprocess. Switching accounts does NOT reuse the previous subprocess (its env var differs).
+- API keys are written into the subprocess env right before spawn and never logged or copied elsewhere.
+- For streams, failover only happens before the first chunk is observed. Once the client starts receiving bytes we cannot re-attempt without breaking the SSE contract.

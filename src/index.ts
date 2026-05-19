@@ -20,6 +20,38 @@ export { handleOpenAICompatibleRequest } from "./openai/handler.js";
 export { mergeOpenCodeConfig, defaultOpenCodeConfigPath } from "./config/opencode-config.js";
 export { buildStatusReport } from "./plugin/status.js";
 
+// Multi-account / rotation surface — useful for advanced users wiring custom
+// front-ends, scripts, or tests.
+export {
+  addApiKeyAccount,
+  ensureCliLoginAccount,
+  loadAccountStore,
+  publicView,
+  removeAccount,
+  saveAccountStore,
+  setAccountEnabled,
+  setStrategy,
+  getAccountsFilePath,
+} from "./auth/account-store.js";
+export type {
+  AccountStore,
+  AccountStrategy,
+  AccountType,
+  KiroAccount,
+  PublicAccountView,
+  AccountRuntimeState,
+} from "./auth/account-store.js";
+export {
+  generateWithRotation,
+  streamWithRotation,
+  AllAccountsExhaustedError,
+  NoAccountsConfiguredError,
+} from "./auth/rotator.js";
+export type { RotationAttempt } from "./auth/rotator.js";
+export { classifyKiroError, isRetryable } from "./auth/error-classifier.js";
+export type { KiroErrorKind, ClassifiedError } from "./auth/error-classifier.js";
+export { pickAccount, planCooldown, timeUntilNextAvailable } from "./auth/rotation.js";
+
 // Default export = the plugin function for opencode.json `plugin` arrays.
 import { KiroPlugin } from "./plugin.js";
 export default KiroPlugin;

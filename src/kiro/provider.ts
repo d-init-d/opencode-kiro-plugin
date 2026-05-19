@@ -1,14 +1,16 @@
 /**
- * Lifecycle wrapper around `kiro-acp-ai-provider`.
+ * Lifecycle wrapper around `kiro-acp-ai-provider` with per-account isolation.
  *
  * Responsibilities:
  *   1. Lazy-import `createKiroAcp()` so the plugin still loads when the
  *      package is missing (we surface a helpful error instead of crashing).
- *   2. Inject `KIRO_API_KEY` into the subprocess environment when the user
- *      authenticated with an API key. The key is never written elsewhere.
+ *   2. Inject `KIRO_API_KEY` into the subprocess environment when the active
+ *      account is API-key based. The key is never written elsewhere.
  *   3. Provide a thin `generate()` and `stream()` interface that the OpenAI
  *      adapter calls into. The interface is intentionally narrow so we can
  *      mock it in tests.
+ *   4. Cache one provider handle per accountId so switching accounts is fast
+ *      and doesn't tear down a working subprocess we still need.
  */
 import { KIRO_API_KEY_ENV, KIRO_IDLE_SHUTDOWN_MS } from "../constants.js";
 import { log } from "../plugin/debug.js";
@@ -18,6 +20,12 @@ import type { AiStreamPart } from "../openai/stream.js";
 export type AuthMode = "api-key" | "cli-login";
 
 export interface KiroAuthContext {
+  /**
+   * Identifier of the account we want to bind this request to.
+   * For backwards compatibility, when the rotation layer is not used,
+   * a synthetic id `"_legacy_${mode}"` is fine.
+   */
+  accountId: string;
   mode: AuthMode;
   /** Only present when mode === 'api-key'. Never logged. */
   apiKey?: string;
@@ -44,56 +52,75 @@ interface ProviderModule {
   default?: unknown;
 }
 
-interface InternalState {
-  handle?: KiroProviderHandle;
-  authKey?: string;
-  authMode?: AuthMode;
+interface CachedHandle {
+  handle: KiroProviderHandle;
+  authMode: AuthMode;
+  /** The API key in use when this handle was created (api-key mode only). */
+  apiKey?: string;
   idleTimer?: NodeJS.Timeout;
+  lastUsedAt: number;
 }
 
-const state: InternalState = {};
+/** key = accountId */
+const handleCache = new Map<string, CachedHandle>();
+/** Used by the API-key path to avoid mutating env if we're already pointed at the right key. */
+let currentEnvKey: string | undefined = process.env[KIRO_API_KEY_ENV];
 
-function clearIdleTimer() {
-  if (state.idleTimer) {
-    clearTimeout(state.idleTimer);
-    state.idleTimer = undefined;
+function clearIdleTimer(cached: CachedHandle): void {
+  if (cached.idleTimer) {
+    clearTimeout(cached.idleTimer);
+    cached.idleTimer = undefined;
   }
 }
 
-function armIdleTimer() {
-  clearIdleTimer();
-  state.idleTimer = setTimeout(() => {
-    log.info("Shutting down idle Kiro provider");
-    void resetProvider("idle");
+function armIdleTimer(accountId: string, cached: CachedHandle): void {
+  clearIdleTimer(cached);
+  cached.idleTimer = setTimeout(() => {
+    log.info("Shutting down idle Kiro provider", { accountId });
+    void disposeAccount(accountId, "idle");
   }, KIRO_IDLE_SHUTDOWN_MS);
-  // Allow the Node process to exit even if the timer is still pending.
-  if (typeof state.idleTimer.unref === "function") state.idleTimer.unref();
+  if (typeof cached.idleTimer.unref === "function") cached.idleTimer.unref();
 }
 
-export async function resetProvider(reason: string): Promise<void> {
-  const { handle } = state;
-  state.handle = undefined;
-  state.authKey = undefined;
-  state.authMode = undefined;
-  clearIdleTimer();
-  if (handle) {
-    try {
-      await handle.shutdown();
-    } catch (err) {
-      log.warn("Kiro provider shutdown failed", { reason, error: String(err) });
-    }
+async function disposeAccount(accountId: string, reason: string): Promise<void> {
+  const cached = handleCache.get(accountId);
+  if (!cached) return;
+  handleCache.delete(accountId);
+  clearIdleTimer(cached);
+  try {
+    await cached.handle.shutdown();
+  } catch (err) {
+    log.warn("Kiro provider shutdown failed", { reason, accountId, error: String(err) });
   }
 }
 
-function ensureEnvForAuth(auth: KiroAuthContext): void {
-  // For api-key auth we set KIRO_API_KEY in our own process env so the spawned
-  // `kiro-cli acp` subprocess inherits it without us writing to disk.
-  // For cli-login auth we explicitly do NOT touch the variable so the existing
-  // session config governs behavior.
-  if (auth.mode === "api-key" && auth.apiKey) {
-    if (process.env[KIRO_API_KEY_ENV] !== auth.apiKey) {
-      process.env[KIRO_API_KEY_ENV] = auth.apiKey;
-    }
+/**
+ * Tear down all cached handles. Used on plugin shutdown.
+ */
+export async function resetProvider(reason: string): Promise<void> {
+  const ids = Array.from(handleCache.keys());
+  for (const id of ids) await disposeAccount(id, reason);
+}
+
+/**
+ * Synchronously set the env var for the next subprocess spawn. Subsequent
+ * spawns inherit this env until we set it again.
+ */
+function setEnvForApiKey(apiKey: string): void {
+  if (currentEnvKey !== apiKey) {
+    process.env[KIRO_API_KEY_ENV] = apiKey;
+    currentEnvKey = apiKey;
+  }
+}
+
+/**
+ * For cli-login mode we need to make sure no stale `KIRO_API_KEY` is leaking
+ * into the subprocess env.
+ */
+function clearEnvForCliLogin(): void {
+  if (process.env[KIRO_API_KEY_ENV]) {
+    delete process.env[KIRO_API_KEY_ENV];
+    currentEnvKey = undefined;
   }
 }
 
@@ -101,20 +128,14 @@ async function loadProviderModule(): Promise<ProviderModule> {
   try {
     return (await import("kiro-acp-ai-provider")) as ProviderModule;
   } catch (err) {
-    log.error("Không import được `kiro-acp-ai-provider`. Hãy cài: npm i kiro-acp-ai-provider", {
+    log.error("Could not import kiro-acp-ai-provider. Run: npm i kiro-acp-ai-provider", {
       error: String(err),
     });
-    throw new Error(
-      "kiro-acp-ai-provider chưa được cài. Chạy: npm i kiro-acp-ai-provider"
-    );
+    throw new Error("kiro-acp-ai-provider not installed. Run: npm i kiro-acp-ai-provider");
   }
 }
 
 function adaptHandle(rawProvider: unknown): KiroProviderHandle {
-  // Support several plausible shapes:
-  //   1. function(modelId) -> LanguageModelV3 (createKiroAcp returns a callable)
-  //   2. { languageModel(modelId) -> LanguageModelV3 }
-  //   3. { chat(modelId) -> LanguageModelV3 }
   let resolveModel: (id: string) => unknown;
   let provider: { shutdown?: () => Promise<void> | void } = {};
 
@@ -134,10 +155,10 @@ function adaptHandle(rawProvider: unknown): KiroProviderHandle {
       const fn = obj["model"] as (id: string) => unknown;
       resolveModel = (id) => fn.call(obj, id);
     } else {
-      throw new Error("kiro-acp-ai-provider trả về object không có hàm tạo model");
+      throw new Error("kiro-acp-ai-provider returned an object without a model factory");
     }
   } else {
-    throw new Error("kiro-acp-ai-provider trả về kết quả không nhận diện được");
+    throw new Error("kiro-acp-ai-provider returned an unrecognized result");
   }
 
   return {
@@ -145,19 +166,19 @@ function adaptHandle(rawProvider: unknown): KiroProviderHandle {
       const raw = resolveModel(modelId);
       const model = (await Promise.resolve(raw)) as Record<string, unknown> | null;
       if (!model || typeof model !== "object") {
-        throw new Error(`Không lấy được language model cho '${modelId}' từ kiro-acp-ai-provider`);
+        throw new Error(`Could not get language model '${modelId}' from kiro-acp-ai-provider`);
       }
       const doGenerate = model["doGenerate"];
       const doStream = model["doStream"];
       if (typeof doGenerate !== "function" && typeof doStream !== "function") {
         throw new Error(
-          `Model '${modelId}' không có doGenerate/doStream. Phiên bản kiro-acp-ai-provider có thể không tương thích.`
+          `Model '${modelId}' has no doGenerate/doStream. The kiro-acp-ai-provider version may be incompatible.`
         );
       }
       return {
         async doGenerate(options) {
           if (typeof doGenerate !== "function") {
-            throw new Error("Model không hỗ trợ doGenerate");
+            throw new Error("Model does not support doGenerate");
           }
           const result = (await (doGenerate as (o: unknown) => Promise<unknown>).call(model, options)) as {
             content?: AiContent[];
@@ -177,13 +198,13 @@ function adaptHandle(rawProvider: unknown): KiroProviderHandle {
         },
         async doStream(options) {
           if (typeof doStream !== "function") {
-            throw new Error("Model không hỗ trợ doStream");
+            throw new Error("Model does not support doStream");
           }
           const result = (await (doStream as (o: unknown) => Promise<unknown>).call(model, options)) as {
             stream?: AsyncIterable<AiStreamPart> | ReadableStream<AiStreamPart>;
           };
           if (!result || !result.stream) {
-            throw new Error("doStream() không trả về stream");
+            throw new Error("doStream() did not return a stream");
           }
           const stream = await toAsyncIterable<AiStreamPart>(result.stream);
           return { stream };
@@ -204,7 +225,6 @@ async function toAsyncIterable<T>(
   if (Symbol.asyncIterator in (source as object)) {
     return source as AsyncIterable<T>;
   }
-  // ReadableStream<T> path
   const reader = (source as ReadableStream<T>).getReader();
   return {
     async *[Symbol.asyncIterator]() {
@@ -225,36 +245,51 @@ async function toAsyncIterable<T>(
   };
 }
 
-function authChanged(prev: InternalState, next: KiroAuthContext): boolean {
-  if (prev.authMode !== next.mode) return true;
-  if (next.mode === "api-key" && prev.authKey !== next.apiKey) return true;
-  return false;
-}
-
 export async function getProvider(auth: KiroAuthContext): Promise<KiroProviderHandle> {
-  ensureEnvForAuth(auth);
-  if (state.handle && !authChanged(state, auth)) {
-    armIdleTimer();
-    return state.handle;
+  const cached = handleCache.get(auth.accountId);
+  // Reuse cache only when the credential material is unchanged.
+  if (cached && cached.authMode === auth.mode && cached.apiKey === auth.apiKey) {
+    if (auth.mode === "api-key" && auth.apiKey) setEnvForApiKey(auth.apiKey);
+    else if (auth.mode === "cli-login") clearEnvForCliLogin();
+    cached.lastUsedAt = Date.now();
+    armIdleTimer(auth.accountId, cached);
+    return cached.handle;
   }
 
-  // Switching auth mode -> tear down existing subprocess so the new env is
-  // picked up cleanly.
-  if (state.handle) {
-    log.info("Auth context changed; restarting Kiro provider");
-    await resetProvider("auth-change");
+  // If credentials changed, dispose the old handle so the new env is picked up.
+  if (cached) {
+    log.info("Credentials changed; restarting provider for account", { accountId: auth.accountId });
+    await disposeAccount(auth.accountId, "credentials-changed");
+  }
+
+  // Set env BEFORE the provider import / spawn so the child process inherits.
+  if (auth.mode === "api-key") {
+    if (!auth.apiKey) throw new Error("API-key auth context is missing apiKey");
+    setEnvForApiKey(auth.apiKey);
+  } else {
+    clearEnvForCliLogin();
   }
 
   const mod = await loadProviderModule();
-  const factory = mod.createKiroAcp ?? (typeof mod.default === "function" ? (mod.default as ProviderModule["createKiroAcp"]) : undefined);
+  const factory =
+    mod.createKiroAcp ?? (typeof mod.default === "function" ? (mod.default as ProviderModule["createKiroAcp"]) : undefined);
   if (typeof factory !== "function") {
-    throw new Error("kiro-acp-ai-provider không export `createKiroAcp`");
+    throw new Error("kiro-acp-ai-provider does not export `createKiroAcp`");
   }
   const raw = factory();
   const resolved = await Promise.resolve(raw);
-  state.handle = adaptHandle(resolved);
-  state.authMode = auth.mode;
-  if (auth.mode === "api-key" && auth.apiKey) state.authKey = auth.apiKey;
-  armIdleTimer();
-  return state.handle;
+  const handle = adaptHandle(resolved);
+  const next: CachedHandle = {
+    handle,
+    authMode: auth.mode,
+    lastUsedAt: Date.now(),
+    ...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
+  };
+  handleCache.set(auth.accountId, next);
+  armIdleTimer(auth.accountId, next);
+  return handle;
+}
+
+export async function disposeProviderForAccount(accountId: string): Promise<void> {
+  await disposeAccount(accountId, "explicit-dispose");
 }

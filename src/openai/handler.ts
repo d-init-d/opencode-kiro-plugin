@@ -4,6 +4,11 @@
  * `auth.loader.fetch` calls `handleOpenAICompatibleRequest()` whenever the
  * synthetic Kiro base URL is hit. This is the single entry point for the
  * adapter; everything below stays pure so it is testable without OpenCode.
+ *
+ * All upstream calls go through the rotation orchestrator, which:
+ *   - Picks an eligible account from `kiro-accounts.json`.
+ *   - Retries with the next account on rate-limit / quota / transient errors.
+ *   - Surfaces auth/client errors verbatim (no silent retries).
  */
 import { z } from "zod";
 import { ChatCompletionRequestSchema } from "./schema.js";
@@ -16,11 +21,21 @@ import {
 import { buildChatCompletionResponse, requestToCallOptions } from "./translate.js";
 import { toOpenAiSseStream } from "./stream.js";
 import { buildModelListResponse } from "../kiro/models.js";
-import { getProvider, type KiroAuthContext } from "../kiro/provider.js";
+import type { KiroAuthContext } from "../kiro/provider.js";
 import { SYNTHETIC_HOST } from "../constants.js";
 import { log } from "../plugin/debug.js";
+import {
+  AllAccountsExhaustedError,
+  NoAccountsConfiguredError,
+  generateWithRotation,
+  streamWithRotation,
+} from "../auth/rotator.js";
 
 export interface HandlerContext {
+  /**
+   * Auth derived from OpenCode's auth hook. The rotator only consults this
+   * when the persistent account store is empty (back-compat mode).
+   */
   auth: KiroAuthContext;
 }
 
@@ -55,6 +70,45 @@ async function handleModels(_req: Request): Promise<Response> {
   return buildJsonResponse(payload);
 }
 
+function rotationErrorToResponse(err: unknown): Response {
+  if (err instanceof NoAccountsConfiguredError) {
+    return buildErrorResponse({
+      status: 401,
+      type: "no_accounts_configured",
+      message: err.message,
+    });
+  }
+  if (err instanceof AllAccountsExhaustedError) {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (err.waitMs && err.waitMs > 0) {
+      headers["Retry-After"] = String(Math.ceil(err.waitMs / 1000));
+    }
+    const body = {
+      error: {
+        type: "kiro_all_accounts_exhausted",
+        message: err.message,
+        code: null as string | null,
+        param: null as string | null,
+        attempts: err.attempts.map((a) => ({
+          account: a.accountLabel,
+          kind: a.error.kind,
+          message: a.error.message,
+        })),
+      },
+    };
+    return new Response(JSON.stringify(body), {
+      status: 429,
+      headers,
+    });
+  }
+  log.warn("Kiro request failed", { error: String(err) });
+  return buildErrorResponse({
+    status: 502,
+    type: "kiro_upstream_error",
+    message: err instanceof Error ? err.message : "Kiro upstream lỗi.",
+  });
+}
+
 async function handleChatCompletions(req: Request, ctx: HandlerContext): Promise<Response> {
   if (req.method !== "POST") return methodNotAllowed("POST");
 
@@ -80,54 +134,32 @@ async function handleChatCompletions(req: Request, ctx: HandlerContext): Promise
   const requestBody = parsed.data;
   const wantsStream = requestBody.stream === true;
   const callOptions = requestToCallOptions(requestBody);
-
-  let provider;
-  try {
-    provider = await getProvider(ctx.auth);
-  } catch (err) {
-    log.error("Lấy Kiro provider thất bại", { error: String(err) });
-    return buildErrorResponse({
-      status: 500,
-      type: "kiro_unavailable",
-      message: err instanceof Error ? err.message : "Không khởi tạo được Kiro provider.",
-    });
-  }
-
-  let model;
-  try {
-    model = await provider.getModel(requestBody.model);
-  } catch (err) {
-    return buildErrorResponse({
-      status: 400,
-      type: "invalid_model",
-      message: err instanceof Error ? err.message : `Model '${requestBody.model}' không hợp lệ.`,
-    });
-  }
-
   const completionId = makeCompletionId();
 
   if (wantsStream) {
-    let streamSource;
     try {
-      streamSource = await model.doStream(callOptions);
-    } catch (err) {
-      log.warn("doStream() lỗi", { error: String(err) });
-      return buildErrorResponse({
-        status: 502,
-        type: "kiro_upstream_error",
-        message: err instanceof Error ? err.message : "Kiro upstream từ chối stream.",
+      const { stream } = await streamWithRotation({
+        modelId: requestBody.model,
+        callOptions,
+        ctxFromAuthHook: ctx.auth,
       });
+      const sse = toOpenAiSseStream({
+        id: completionId,
+        model: requestBody.model,
+        source: stream,
+      });
+      return buildSseResponse(sse);
+    } catch (err) {
+      return rotationErrorToResponse(err);
     }
-    const sse = toOpenAiSseStream({
-      id: completionId,
-      model: requestBody.model,
-      source: streamSource.stream,
-    });
-    return buildSseResponse(sse);
   }
 
   try {
-    const result = await model.doGenerate(callOptions);
+    const { result } = await generateWithRotation({
+      modelId: requestBody.model,
+      callOptions,
+      ctxFromAuthHook: ctx.auth,
+    });
     const response = buildChatCompletionResponse({
       id: completionId,
       model: requestBody.model,
@@ -137,12 +169,7 @@ async function handleChatCompletions(req: Request, ctx: HandlerContext): Promise
     });
     return buildJsonResponse(response);
   } catch (err) {
-    log.warn("doGenerate() lỗi", { error: String(err) });
-    return buildErrorResponse({
-      status: 502,
-      type: "kiro_upstream_error",
-      message: err instanceof Error ? err.message : "Kiro upstream lỗi.",
-    });
+    return rotationErrorToResponse(err);
   }
 }
 
@@ -163,8 +190,6 @@ export async function handleOpenAICompatibleRequest(
   }
   if (!isSyntheticUrl(url)) return undefined;
 
-  // Strip leading `/v1` if present so we accept both `/v1/models` and
-  // `/models` for forward compatibility.
   const path = url.pathname.replace(/^\/v1/, "") || "/";
 
   if (path === "/models" || path === "/models/") {
@@ -176,8 +201,6 @@ export async function handleOpenAICompatibleRequest(
     return handleChatCompletions(request, context);
   }
 
-  // `health` is a non-standard convenience endpoint. Useful when running
-  // smoke tests against the interceptor.
   if (path === "/health") {
     return buildJsonResponse({ ok: true });
   }

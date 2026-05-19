@@ -11,9 +11,12 @@ Use **Kiro** models from inside [Opencode](https://opencode.ai) by reusing your 
 - **Claude Opus 4.7 / 4.6**, **Sonnet 4.6**, **Haiku 4.5** through Kiro
 - **DeepSeek 3.2** and **Qwen3 Coder Next** when your Kiro plan exposes them
 - **Two auth modes** — `KIRO_API_KEY` paste or existing `kiro-cli login` session
+- **Multi-account rotation** — add multiple Kiro keys, plugin auto-fails over on rate limit / quota / 5xx
+- **Three rotation strategies** — `sticky`, `round-robin`, `hybrid` (default: stick to one account, switch only on errors)
 - **Streaming + tool calls** — full SSE pipeline, including assistant `tool_calls`
+- **First-chunk failover** — streaming requests can switch accounts before any byte reaches the client
 - **Auto-config** — one click to add provider/model entries to `opencode.json`
-- **Secret hygiene** — keys never written to repo files; logs redact `ksk_*`, bearer, JWT, and OAuth token fields
+- **Secret hygiene** — keys stored in `~/.config/opencode/kiro-accounts.json` (mode `0600`); never written to `opencode.json`; logs redact `ksk_*`, bearer, JWT, and OAuth token fields
 - **In-process** — no daemon, no localhost server, no `ngrok`-style routing
 
 ---
@@ -152,6 +155,86 @@ Add this to your `~/.config/opencode/opencode.json`:
 
 ---
 
+## Multi-Account Rotation
+
+Add several Kiro API keys (and optionally one existing `kiro-cli login` session) so the plugin can fail over automatically when one account is rate-limited, quota-exhausted, or returns 5xx errors. This mirrors the behavior of `opencode-antigravity-auth`'s multi-account flow but uses Kiro's API key model instead of OAuth.
+
+### Add accounts
+
+```bash
+opencode auth login
+# → Kiro → "Kiro API Key (add account)"   # repeat for each `ksk_...` you own
+# → Kiro → "Use existing kiro-cli login"  # optional fallback
+```
+
+Each invocation appends to `~/.config/opencode/kiro-accounts.json` (mode `0600`). Duplicate keys are detected and ignored.
+
+### Inspect & manage
+
+```bash
+opencode auth login
+# → Kiro → "List Kiro accounts"
+# → Kiro → "Manage Kiro accounts (enable/disable/remove)"
+# → Kiro → "Set rotation strategy (sticky / round-robin / hybrid)"
+```
+
+You can also run the `kiro_accounts` tool inside any Opencode session to see the current state without leaving the chat.
+
+### Strategies
+
+| Strategy | When to use |
+|----------|-------------|
+| `hybrid` (default) | Best for most users. Sticks to the first eligible account; switches only when it hits an error. Preserves prompt cache. |
+| `sticky` | Single-account workflows. Same as hybrid but won't auto-rotate even when an account is on cooldown — surfaces the error directly. |
+| `round-robin` | Many short requests. Picks the least recently used eligible account every call to spread load evenly. |
+
+### Cooldown policy
+
+When an account fails, the plugin classifies the error and applies the right cooldown before considering it eligible again:
+
+| Error class | Detection | Cooldown |
+|-------------|-----------|----------|
+| `rate_limit` | HTTP 429 or "rate limit / throttled" wording | 60s, doubling per consecutive failure, capped at 30 min |
+| `quota_exceeded` | HTTP 402 or "quota / billing / credits" wording | 15 min flat |
+| `transient` | HTTP 5xx, `ECONNRESET`, fetch failed, "bad gateway" | 10s, doubling, capped at 5 min |
+| `auth` | HTTP 401/403 or "invalid api key / forbidden" wording | 24 h **and** account is auto-disabled (re-add to recover) |
+| `client_error` | HTTP 4xx other than auth/rate | not penalized — request is malformed |
+| `unknown` | catch-all | 30s short cooldown |
+
+Auth errors are intentionally **not** retried on a different account — the request is the problem, not the account choice. The original error is surfaced to the caller.
+
+### When all accounts are on cooldown
+
+The plugin returns HTTP 429 with a `Retry-After` header and a JSON body:
+
+```json
+{
+  "error": {
+    "type": "kiro_all_accounts_exhausted",
+    "message": "Tất cả tài khoản Kiro đều đang cooldown. Thử lại sau 42s. Chi tiết: work[rate_limit], personal[rate_limit]",
+    "attempts": [
+      { "account": "work", "kind": "rate_limit", "message": "..." },
+      { "account": "personal", "kind": "rate_limit", "message": "..." }
+    ]
+  }
+}
+```
+
+`Retry-After` is set to the number of seconds until the first account becomes eligible again, so well-behaved clients (including Opencode) can back off automatically.
+
+### Reset state
+
+If something gets stuck, delete the store and re-add accounts:
+
+```bash
+rm ~/.config/opencode/kiro-accounts.json
+opencode auth login
+```
+
+The plugin holds no in-memory state beyond the lifetime of a single Opencode session, so a restart also clears any transient cooldown timers.
+
+---
+
 ## Auth Modes
 
 ### 1. Existing `kiro-cli login`
@@ -205,8 +288,9 @@ Two custom Opencode tools ship with the plugin:
 
 | Tool | Purpose |
 |------|---------|
-| `kiro_status` | Reports whether `kiro-cli` is installed/authenticated, the active auth mode, and the current model list. Output is fully redacted. |
+| `kiro_status` | Reports whether `kiro-cli` is installed/authenticated, the active auth mode, account count, cooldown summary, and the current model list. Output is fully redacted. |
 | `kiro_models` | Returns the merged model catalog (dynamic list from `kiro-acp-ai-provider` when supported, curated catalog otherwise). |
+| `kiro_accounts` | Read-only view of the configured Kiro accounts, the active rotation strategy, and the time until the next eligible account becomes available. Never returns the raw API key. |
 
 Use them from inside an Opencode session, for example:
 
@@ -222,6 +306,7 @@ Use them from inside an Opencode session, for example:
 |------|------|-------------------|
 | Main Opencode config | `~/.config/opencode/opencode.json` | **No** — only provider/model definitions |
 | Plugin config | `~/.config/opencode/kiro.json` | **No** — non-secret preferences only |
+| Account store | `~/.config/opencode/kiro-accounts.json` | **Yes** — API keys (mode `0600`, never copied to other files) |
 | Opencode auth storage | managed by Opencode | Yes (when using API key mode) |
 | `kiro-cli` token cache | managed by `kiro-cli` | Yes (when using CLI login mode) |
 
@@ -372,9 +457,9 @@ examples/opencode.jsonc
 ## Roadmap (post-MVP)
 
 - Optional `/v1/embeddings` passthrough when `kiro-acp-ai-provider` exposes an embeddings model
-- Multi-account rotation when running several Kiro plans side by side
 - Optional spawn-and-monitor `kiro-cli login` flow once it can be made non-interactive
 - Anthropic `/v1/messages` shim for tools that prefer that shape
+- Soft quota threshold (skip an account before it fully exhausts) like `opencode-antigravity-auth`
 
 These are explicitly **out of scope for the MVP** in [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md).
 

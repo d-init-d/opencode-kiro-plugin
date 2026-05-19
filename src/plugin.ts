@@ -9,6 +9,7 @@ import { DEFAULT_PROVIDER_ID } from "./constants.js";
 import { buildKiroAuthHook } from "./auth/loader.js";
 import { createKiroStatusTool } from "./tools/kiro_status.js";
 import { createKiroModelsTool } from "./tools/kiro_models.js";
+import { createKiroAccountsTool } from "./tools/kiro_accounts.js";
 import { resetProvider } from "./kiro/provider.js";
 import { log } from "./plugin/debug.js";
 
@@ -43,6 +44,7 @@ export function createKiroPlugin(options: KiroPluginOptions = {}): (input?: unkn
     const tool: Record<string, unknown> = {
       kiro_status: createKiroStatusTool({ pluginVersion: version }),
       kiro_models: createKiroModelsTool(),
+      kiro_accounts: createKiroAccountsTool(),
     };
 
     return {
