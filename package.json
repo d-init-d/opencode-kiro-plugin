@@ -1,6 +1,6 @@
 {
   "name": "opencode-kiro-plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Use Kiro models from Opencode via in-process kiro-cli acp bridge with API-key or existing CLI login auth.",
   "homepage": "https://github.com/d-init-d/opencode-kiro-plugin",
   "repository": {
@@ -56,7 +56,7 @@
     "zod": "^3.23.8"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.14.0"
+    "@opencode-ai/plugin": "*"
   },
   "peerDependenciesMeta": {
     "@opencode-ai/plugin": {
