@@ -1,0 +1,19 @@
+node_modules
+dist
+coverage
+.vitest-cache
+
+# Editor
+.vscode
+.idea
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local secrets - NEVER commit
+.env
+.env.*
+*.key
+kiro-token*.json

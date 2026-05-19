@@ -1,0 +1,11 @@
+src
+tests
+node_modules
+coverage
+*.tsbuildinfo
+tsconfig*.json
+vitest.config.ts
+.gitignore
+.github
+IMPLEMENTATION_PLAN.md
+OPUS_EXECUTION_PROMPT.md

@@ -1,0 +1,31 @@
+// Sample OpenCode config that wires the Kiro plugin in.
+//
+// The synthetic baseURL is intercepted by the plugin's auth.loader.fetch,
+// so no real network call is made. The host is purely a routing tag.
+//
+// IMPORTANT: never paste your KIRO_API_KEY into this file. Use
+// `opencode auth login` -> Kiro -> "Kiro API Key" and OpenCode will
+// store the key in its own secure auth storage.
+{
+  "plugin": ["opencode-kiro-plugin"],
+  "provider": {
+    "kiro": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Kiro",
+      "options": {
+        "baseURL": "https://kiro.local/v1"
+      },
+      "models": {
+        "auto": { "name": "Kiro Auto" },
+        "claude-opus-4.7": { "name": "Kiro Claude Opus 4.7" },
+        "claude-opus-4.6": { "name": "Kiro Claude Opus 4.6" },
+        "claude-sonnet-4.6": { "name": "Kiro Claude Sonnet 4.6" },
+        "claude-haiku-4.5": { "name": "Kiro Claude Haiku 4.5" },
+        "deepseek-3.2": { "name": "Kiro DeepSeek 3.2" },
+        "qwen3-coder-next": { "name": "Kiro Qwen3 Coder Next" }
+      }
+    }
+  },
+  "model": "kiro/claude-opus-4.6",
+  "small_model": "kiro/claude-sonnet-4.6"
+}
