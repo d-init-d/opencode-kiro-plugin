@@ -56,7 +56,8 @@ function methodNotAllowed(allowed: string): Response {
 }
 
 function isSyntheticUrl(url: URL): boolean {
-  return url.hostname.toLowerCase() === SYNTHETIC_HOST;
+  const host = url.hostname.toLowerCase();
+  return host === SYNTHETIC_HOST || host === "127.0.0.1" || host === "localhost";
 }
 
 function describeZodError(error: z.ZodError): string {

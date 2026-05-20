@@ -73,20 +73,20 @@ describe("ensureLocalServer", () => {
     expect(ids).toContain("claude-opus-4.6");
   });
 
-  it("rejects requests without bearer token", async () => {
+  it("accepts requests without bearer token (localhost trust model)", async () => {
     const { ensureLocalServer } = await import("../src/server/local-server.js");
     const handle = await ensureLocalServer();
     const res = await fetch(`${handle.baseURL}/models`);
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(200);
   });
 
-  it("rejects requests with the wrong bearer token", async () => {
+  it("accepts requests with any bearer token (localhost trust model)", async () => {
     const { ensureLocalServer } = await import("../src/server/local-server.js");
     const handle = await ensureLocalServer();
     const res = await fetch(`${handle.baseURL}/models`, {
       headers: { Authorization: "Bearer wrong-token" },
     });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(200);
   });
 
   it("is idempotent: calling twice returns the same handle", async () => {

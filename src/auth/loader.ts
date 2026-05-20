@@ -202,15 +202,9 @@ export function buildKiroAuthHook(providerId: string): KiroAuthHook {
           const request = input instanceof Request ? input.clone() : new Request(input as string, init);
           const handled = await handleOpenAICompatibleRequest(request, { auth: ctx });
           if (handled) return handled;
-          return new Response(
-            JSON.stringify({
-              error: {
-                type: "kiro_unsupported_url",
-                message: `Kiro plugin chỉ phục vụ ${request.url ? new URL(request.url).hostname : "kiro.local"}.`,
-              },
-            }),
-            { status: 400, headers: { "Content-Type": "application/json" } }
-          );
+          // If we reach here, the URL is not one we handle. Pass through to
+          // the default fetch so other providers are not blocked.
+          return globalThis.fetch(request);
         },
       };
     },
