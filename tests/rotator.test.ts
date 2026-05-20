@@ -197,3 +197,62 @@ describe("streamWithRotation", () => {
     expect(collected).toContain(ids.b);
   });
 });
+
+describe("mixed api-key + cli-login rotation", () => {
+  it("falls over from a rate-limited API key to the CLI-login account", async () => {
+    const { addApiKeyAccount, ensureCliLoginAccount } = await import("../src/auth/account-store.js");
+    const apiAcc = await addApiKeyAccount({ label: "api", apiKey: "ksk_KEYKEYKEYKEYKEYKEYKEYK" });
+    const cliAcc = await ensureCliLoginAccount();
+    behaviorByAccount[apiAcc.id] = "rate-limit";
+    behaviorByAccount[cliAcc.id] = "ok";
+    const { generateWithRotation } = await import("../src/auth/rotator.js");
+    const out = await generateWithRotation({
+      modelId: "claude-opus-4.6",
+      callOptions: { prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }] },
+    });
+    expect(out.accountId).toBe(cliAcc.id);
+    expect(calls.map((c) => c.accountId)).toEqual([apiAcc.id, cliAcc.id]);
+  });
+
+  it("falls over from a broken CLI-login session to a healthy API key", async () => {
+    const { addApiKeyAccount, ensureCliLoginAccount, setStrategy } = await import(
+      "../src/auth/account-store.js"
+    );
+    const cliAcc = await ensureCliLoginAccount();
+    const apiAcc = await addApiKeyAccount({ label: "api", apiKey: "ksk_KEYKEYKEYKEYKEYKEYKEYK" });
+    // Force CLI account to be tried first by switching to round-robin which
+    // prefers the LRU; cli was just created so its lastUsedAt is undefined.
+    await setStrategy("round-robin");
+    behaviorByAccount[cliAcc.id] = "transient";
+    behaviorByAccount[apiAcc.id] = "ok";
+    const { generateWithRotation } = await import("../src/auth/rotator.js");
+    const out = await generateWithRotation({
+      modelId: "claude-opus-4.6",
+      callOptions: { prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }] },
+    });
+    expect(out.accountId).toBe(apiAcc.id);
+  });
+
+  it("disables CLI-login on auth error so subsequent calls skip it", async () => {
+    const { addApiKeyAccount, ensureCliLoginAccount, loadAccountStore, setStrategy } = await import(
+      "../src/auth/account-store.js"
+    );
+    const cliAcc = await ensureCliLoginAccount();
+    const apiAcc = await addApiKeyAccount({ label: "api", apiKey: "ksk_KEYKEYKEYKEYKEYKEYKEYK" });
+    await setStrategy("round-robin");
+    behaviorByAccount[cliAcc.id] = "auth";
+    const { generateWithRotation } = await import("../src/auth/rotator.js");
+    await expect(
+      generateWithRotation({
+        modelId: "claude-opus-4.6",
+        callOptions: { prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }] },
+      })
+    ).rejects.toThrow();
+    const store = await loadAccountStore();
+    const storedCli = store.accounts.find((a) => a.id === cliAcc.id);
+    expect(storedCli?.enabled).toBe(false);
+    // API key remains enabled.
+    const storedApi = store.accounts.find((a) => a.id === apiAcc.id);
+    expect(storedApi?.enabled).toBe(true);
+  });
+});

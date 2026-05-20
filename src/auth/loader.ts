@@ -1,22 +1,30 @@
 /**
- * OpenCode auth hooks for the Kiro provider.
+ * OpenCode auth hook for the Kiro provider.
  *
- * The shape returned here matches what `opencode-antigravity-auth` uses:
+ * The shape returned here matches the v1.2.x plugin contract used by
+ * `sst/opencode` (verified by reverse-engineering `opencode-antigravity-auth`):
+ *
  *   {
  *     auth: {
- *       provider,            // provider id this loader belongs to
- *       loader: async (...) => ({ apiKey, fetch }),
- *       methods: [...]
- *     }
+ *       provider: string,
+ *       loader: (getAuth, provider) => Promise<{ apiKey, fetch }>,
+ *       methods: AuthMethod[]
+ *     },
+ *     event?: (payload) => void,
+ *     tool?: Record<string, unknown>
  *   }
  *
- * Compared to a single-account plugin, the methods here cover:
- *   - "Kiro API Key" / "Use existing kiro-cli login"   — first-time setup
- *   - "Add another Kiro API key"                       — multi-account
- *   - "Manage Kiro accounts"                            — enable/disable/remove
- *   - "Set rotation strategy"                           — sticky/round-robin/hybrid
- *   - "Check Kiro account status"                       — read-only status snapshot
- *   - "Configure Kiro models in opencode.json"          — provider/model wiring
+ * `AuthMethod` collects user input through `prompts: AuthPrompt[]` and reacts
+ * via `authorize(inputs)`. This is what surfaces in `opencode auth login`.
+ *
+ * For Kiro we provide:
+ *   1. "Kiro API Key" (`type: "api"`) — paste a `ksk_...` value via OpenCode's
+ *      built-in API-key prompt. OpenCode persists the value in its own auth
+ *      storage; we mirror it into the plugin's account store on first use.
+ *   2. "Kiro CLI session" (`type: "oauth"`, manual) — uses the existing
+ *      `kiro-cli login` session. We surface a one-shot setup link with
+ *      instructions but never spawn the login ourselves (per the project's
+ *      MVP guard rails).
  */
 import { handleOpenAICompatibleRequest } from "../openai/handler.js";
 import { mergeOpenCodeConfig } from "../config/opencode-config.js";
@@ -26,47 +34,74 @@ import {
   addApiKeyAccount,
   ensureCliLoginAccount,
   loadAccountStore,
-  publicView,
-  removeAccount,
-  setAccountEnabled,
-  setStrategy,
-  type AccountStrategy,
 } from "./account-store.js";
 import type { KiroAuthContext } from "../kiro/provider.js";
 import { log } from "../plugin/debug.js";
 
+// ---------- Types mirrored from @opencode-ai/plugin ----------
+//
+// We mirror these here because @opencode-ai/plugin is a peerDependency that
+// users may have installed at any version. Importing the runtime types would
+// couple us to a specific version. Anything we use is structural so this is
+// safe.
+
 export interface OpenCodeAuthValue {
   type?: string;
-  /** API-key auth from OpenCode's manual flow. */
+  /** Set by OpenCode when `type === "api"`. */
   key?: string;
   apiKey?: string;
-  /** OAuth-style auth, currently unused by the Kiro plugin. */
+  /** Set by OpenCode when `type === "oauth"`. */
   access?: string;
   refresh?: string;
+  expires?: number;
 }
 
-export interface KiroLoaderResult {
+export type GetAuth = () => Promise<OpenCodeAuthValue> | OpenCodeAuthValue;
+
+export interface LoaderResult {
   apiKey: string;
   fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 }
 
-export interface KiroAuthMethod {
-  type: "api" | "oauth" | "custom";
+export type AuthPrompt =
+  | {
+      type: "text";
+      key: string;
+      message: string;
+      placeholder?: string;
+      validate?: (value: string) => string | undefined;
+      condition?: (inputs: Record<string, string>) => boolean;
+    }
+  | {
+      type: "select";
+      key: string;
+      message: string;
+      options: Array<{ label: string; value: string; hint?: string }>;
+      condition?: (inputs: Record<string, string>) => boolean;
+    };
+
+export interface OAuthAuthorizationResult {
+  url: string;
+  instructions: string;
+  method: "auto" | "code";
+  callback: ((code?: string) => Promise<unknown>) | (() => Promise<unknown>);
+}
+
+export interface AuthMethod {
+  provider?: string;
   label: string;
-  /** Optional setup function invoked when the user picks the method. */
-  setup?: (input?: unknown) => Promise<unknown>;
-  /** Some OpenCode versions look at `instructions` to render help. */
-  instructions?: string;
+  type: "oauth" | "api";
+  prompts?: AuthPrompt[];
+  authorize?: (inputs?: Record<string, string>) => Promise<OAuthAuthorizationResult>;
 }
 
 export interface KiroAuthHook {
   provider: string;
-  loader: (
-    getAuth: () => Promise<OpenCodeAuthValue | undefined> | OpenCodeAuthValue | undefined,
-    provider: unknown
-  ) => Promise<KiroLoaderResult>;
-  methods: KiroAuthMethod[];
+  loader: (getAuth: GetAuth, provider: unknown) => Promise<LoaderResult | Record<string, unknown>>;
+  methods: AuthMethod[];
 }
+
+// ---------- Implementation ----------
 
 function deriveAuthContextFromHook(value: OpenCodeAuthValue | undefined): KiroAuthContext {
   // The auth hook context is now only a hint for the rotator's back-compat
@@ -76,23 +111,68 @@ function deriveAuthContextFromHook(value: OpenCodeAuthValue | undefined): KiroAu
   if (candidate && typeof candidate === "string" && candidate.length > 0) {
     return { accountId: "_hook_apikey", mode: "api-key", apiKey: candidate };
   }
+  // OAuth-shaped auth from the "kiro-cli session" method.
+  if (value?.type === "oauth" || value?.refresh || value?.access) {
+    return { accountId: "_hook_cli", mode: "cli-login" };
+  }
   return { accountId: "_hook_cli", mode: "cli-login" };
 }
 
-interface AddApiKeySetupInput {
-  apiKey?: string;
-  key?: string;
-  label?: string;
-  note?: string;
+/**
+ * Mirror an API key from OpenCode's auth storage into our account store the
+ * first time we see it. We keep OpenCode's storage as the source of truth and
+ * use ours for the rotation/cooldown layer.
+ */
+async function mirrorHookKeyIntoStore(value: OpenCodeAuthValue | undefined): Promise<void> {
+  const candidate = value?.key ?? value?.apiKey;
+  if (!candidate || typeof candidate !== "string") return;
+  try {
+    const store = await loadAccountStore();
+    const exists = store.accounts.some((a) => a.type === "api-key" && a.apiKey === candidate);
+    if (exists) return;
+    await addApiKeyAccount({
+      apiKey: candidate,
+      label: `OpenCode auth (${maskApiKey(candidate)})`,
+    });
+    log.info("Mirrored OpenCode API key into Kiro account store", {
+      keyMasked: maskApiKey(candidate),
+    });
+  } catch (err) {
+    log.warn("Could not mirror OpenCode key into account store", { error: String(err) });
+  }
 }
 
-interface ManageAccountsInput {
-  action?: "enable" | "disable" | "remove" | "list";
-  accountId?: string;
-}
-
-interface SetStrategyInput {
-  strategy?: AccountStrategy;
+/**
+ * Called by the "Kiro CLI session" method's `authorize` flow. Probes whether
+ * `kiro-cli` is logged in and creates the implicit cli-login account when
+ * everything checks out.
+ */
+async function authorizeViaExistingCliLogin(): Promise<OAuthAuthorizationResult> {
+  const state = await inspectCliAuthState();
+  await ensureCliLoginAccount();
+  const ok = state.installed && state.authenticated;
+  const detail =
+    state.detail ??
+    (ok
+      ? "Đã phát hiện phiên `kiro-cli login`. Nhấn Enter để hoàn tất."
+      : "Plugin sẽ thử dùng phiên `kiro-cli login` nếu có. Bạn có thể chạy `kiro-cli login` ở terminal khác trước.");
+  return {
+    url: "https://github.com/d-init-d/opencode-kiro-plugin#auth-modes",
+    instructions: ok
+      ? `${detail}\n(Plugin chỉ kiểm tra phiên hiện tại — không tự đăng nhập thay bạn.)`
+      : `${detail}\nChạy: kiro-cli login\nSau đó quay lại đây và nhấn Enter.`,
+    method: "auto",
+    async callback() {
+      const recheck = await inspectCliAuthState();
+      if (!recheck.installed) {
+        throw new Error("`kiro-cli` không có trên PATH. Cài trước rồi thử lại.");
+      }
+      if (!recheck.authenticated) {
+        throw new Error("Phiên `kiro-cli login` chưa hoạt động. Chạy `kiro-cli login` rồi thử lại.");
+      }
+      return { type: "oauth" as const, refresh: "kiro-cli", access: "kiro-cli", expires: Date.now() + 24 * 60 * 60 * 1000 };
+    },
+  };
 }
 
 /**
@@ -110,6 +190,11 @@ export function buildKiroAuthHook(providerId: string): KiroAuthHook {
         mode: ctx.mode,
         keyMasked: ctx.apiKey ? maskApiKey(ctx.apiKey) : "",
       });
+
+      // Best-effort: copy any newly-pasted API key into our store so rotation
+      // can reach it. Errors here are non-fatal; the rotator falls back to
+      // the in-memory legacy account when the store is empty.
+      void mirrorHookKeyIntoStore(value);
 
       return {
         apiKey: ctx.apiKey ?? "kiro-acp",
@@ -132,108 +217,49 @@ export function buildKiroAuthHook(providerId: string): KiroAuthHook {
     methods: [
       {
         type: "api",
-        label: "Kiro API Key (add account)",
-        instructions:
-          "Dán giá trị KIRO_API_KEY (bắt đầu bằng `ksk_...`). Plugin lưu key vào ~/.config/opencode/kiro-accounts.json (mode 0600), KHÔNG ghi vào opencode.json. Có thể thêm nhiều key để xoay tự động.",
-        setup: async (input) => {
-          const data = (input ?? {}) as AddApiKeySetupInput;
-          const key = (data.apiKey ?? data.key ?? "").trim();
-          const shape = inspectApiKeyShape(key);
-          if (!shape.ok) {
-            return { ok: false, error: shape.hint ?? "Key không hợp lệ" };
-          }
-          const account = await addApiKeyAccount({
-            apiKey: key,
-            label: data.label && data.label.length > 0 ? data.label : `account-${new Date().toISOString().slice(0, 16)}`,
-            ...(data.note ? { note: data.note } : {}),
-          });
-          return { ok: true, account: publicView(account) };
-        },
+        label: "Kiro API Key",
+        prompts: [
+          {
+            type: "text",
+            key: "key",
+            message:
+              "Dán KIRO_API_KEY (định dạng `ksk_...`). Plugin sẽ lưu vào ~/.config/opencode/kiro-accounts.json (mode 0600), KHÔNG ghi vào opencode.json. Có thể chạy lại để thêm account khác.",
+            placeholder: "ksk_xxxxxxxxxxxxxxxxxxxxxxxx",
+            validate(value: string) {
+              const result = inspectApiKeyShape(value);
+              return result.ok ? undefined : result.hint;
+            },
+          },
+        ],
       },
       {
-        type: "custom",
+        type: "oauth",
         label: "Use existing kiro-cli login",
-        instructions:
-          "Bạn cần chạy `kiro-cli login` trên cùng máy trước. Plugin sẽ thêm một mục `cli-login` vào danh sách tài khoản và dùng phiên đăng nhập đó. Có thể vẫn xoay sang API key khi CLI bị lỗi.",
-        setup: async () => {
-          const state = await inspectCliAuthState();
-          const account = await ensureCliLoginAccount();
+        authorize: authorizeViaExistingCliLogin,
+      },
+      // Advanced action: configure provider entries in opencode.json.
+      {
+        type: "oauth",
+        label: "Configure Kiro models in opencode.json",
+        async authorize(): Promise<OAuthAuthorizationResult> {
           return {
-            account: publicView(account),
-            cli: {
-              installed: state.installed,
-              authenticated: state.authenticated,
-              version: state.version ?? null,
-              detail: state.detail ?? null,
+            url: "https://github.com/d-init-d/opencode-kiro-plugin#models",
+            instructions:
+              "Plugin sẽ tự thêm provider/model Kiro vào ~/.config/opencode/opencode.json (có backup .bak.<timestamp>). Nhấn Enter để tiếp tục.",
+            method: "auto",
+            async callback() {
+              const result = await mergeOpenCodeConfig({ providerId });
+              if (!result.changed) {
+                return { type: "oauth" as const, refresh: "noop", access: "noop", expires: Date.now() + 24 * 60 * 60 * 1000 };
+              }
+              return {
+                type: "oauth" as const,
+                refresh: "configured",
+                access: "configured",
+                expires: Date.now() + 24 * 60 * 60 * 1000,
+              };
             },
           };
-        },
-      },
-      {
-        type: "custom",
-        label: "List Kiro accounts",
-        instructions: "Hiển thị danh sách tài khoản hiện có (không lộ giá trị key).",
-        setup: async () => {
-          const store = await loadAccountStore();
-          return {
-            strategy: store.strategy,
-            accounts: store.accounts.map(publicView),
-          };
-        },
-      },
-      {
-        type: "custom",
-        label: "Manage Kiro accounts (enable/disable/remove)",
-        instructions:
-          "Truyền `{ action: 'enable'|'disable'|'remove', accountId }` hoặc `{ action: 'list' }`.",
-        setup: async (input) => {
-          const data = (input ?? {}) as ManageAccountsInput;
-          const action = data.action ?? "list";
-          if (action === "list") {
-            const store = await loadAccountStore();
-            return { strategy: store.strategy, accounts: store.accounts.map(publicView) };
-          }
-          if (!data.accountId) {
-            return { ok: false, error: "Cần truyền accountId" };
-          }
-          if (action === "remove") {
-            const removed = await removeAccount(data.accountId);
-            return { ok: removed, action, accountId: data.accountId };
-          }
-          if (action === "enable" || action === "disable") {
-            const updated = await setAccountEnabled(data.accountId, action === "enable");
-            if (!updated) return { ok: false, error: "Không tìm thấy account" };
-            return { ok: true, action, account: publicView(updated) };
-          }
-          return { ok: false, error: `Hành động không hợp lệ: ${action}` };
-        },
-      },
-      {
-        type: "custom",
-        label: "Set rotation strategy (sticky / round-robin / hybrid)",
-        instructions:
-          "Truyền `{ strategy: 'sticky' | 'round-robin' | 'hybrid' }`. Mặc định là `hybrid`: giữ tài khoản hiện tại, tự xoay khi gặp lỗi.",
-        setup: async (input) => {
-          const data = (input ?? {}) as SetStrategyInput;
-          if (
-            data.strategy !== "sticky" &&
-            data.strategy !== "round-robin" &&
-            data.strategy !== "hybrid"
-          ) {
-            return { ok: false, error: "strategy phải là 'sticky' | 'round-robin' | 'hybrid'" };
-          }
-          const store = await setStrategy(data.strategy);
-          return { ok: true, strategy: store.strategy };
-        },
-      },
-      {
-        type: "custom",
-        label: "Configure Kiro models in opencode.json",
-        instructions:
-          "Tự động thêm provider/model Kiro vào ~/.config/opencode/opencode.json. Có backup trước khi ghi đè.",
-        setup: async () => {
-          const result = await mergeOpenCodeConfig({ providerId });
-          return result;
         },
       },
     ],

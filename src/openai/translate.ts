@@ -318,21 +318,51 @@ export function finishReasonToOpenAI(reason: AiFinishReason | string | undefined
 }
 
 export interface AiUsage {
-  inputTokens?: number;
-  outputTokens?: number;
-  totalTokens?: number;
+  inputTokens?: unknown;
+  outputTokens?: unknown;
+  totalTokens?: unknown;
 }
 
 export function usageToOpenAI(usage: AiUsage | undefined): ChatCompletionUsage | undefined {
   if (!usage) return undefined;
-  const prompt = usage.inputTokens ?? 0;
-  const completion = usage.outputTokens ?? 0;
-  const total = usage.totalTokens ?? prompt + completion;
+  const prompt = normalizeTokenCount(usage.inputTokens) ?? 0;
+  const completion = normalizeTokenCount(usage.outputTokens) ?? 0;
+  const total = normalizeTokenCount(usage.totalTokens) ?? prompt + completion;
   return {
     prompt_tokens: prompt,
     completion_tokens: completion,
     total_tokens: total,
   };
+}
+
+/**
+ * kiro-acp-ai-provider sometimes returns token counts as objects like
+ * `{ total: 313093, noCache: 313093 }` instead of plain numbers. Normalize
+ * to a plain number so downstream validators (OpenCode's @ai-sdk/openai-compatible)
+ * don't reject the chunk.
+ */
+function normalizeTokenCount(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    if (typeof obj["total"] === "number") return obj["total"];
+    // Fallback: sum all numeric values.
+    let sum = 0;
+    let found = false;
+    for (const v of Object.values(obj)) {
+      if (typeof v === "number" && Number.isFinite(v)) {
+        sum += v;
+        found = true;
+        break; // Take the first numeric value as the count.
+      }
+    }
+    if (found) return sum;
+  }
+  if (typeof value === "string") {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
 }
 
 export interface AiContent {

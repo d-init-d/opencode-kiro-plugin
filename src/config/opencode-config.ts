@@ -221,3 +221,109 @@ export async function mergeOpenCodeConfig(
     }
   }
 }
+
+
+// ---------- Local server sync ----------
+
+export interface SyncLocalServerInput {
+  providerId?: string;
+  baseURL: string;
+  bearerToken: string;
+  configPath?: string;
+}
+
+/**
+ * Update the provider entry to point at the in-process local server.
+ *
+ * Unlike `mergeOpenCodeConfig()` this is called on EVERY plugin load because
+ * the local server picks a random port each time and the bearer token is
+ * regenerated. Touching `opencode.json` on every start is OK because:
+ *   - the only fields we touch are `provider.<id>.options.{baseURL, headers}`
+ *   - we never overwrite plugin/provider lists or model defaults
+ *   - we never write user secrets here (the bearer is a per-process random
+ *     value used only between OpenCode and the in-process server)
+ *
+ * If the user has not yet registered the Kiro provider via
+ * `mergeOpenCodeConfig`, this function bootstraps a minimal entry so OpenCode
+ * still recognises the provider id.
+ */
+export async function syncOpenCodeProviderToLocalServer(
+  input: SyncLocalServerInput
+): Promise<{ configPath: string; changed: boolean }> {
+  const configPath = input.configPath ?? defaultOpenCodeConfigPath();
+  const providerId = input.providerId ?? DEFAULT_PROVIDER_ID;
+
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+
+  let release: (() => Promise<void>) | undefined;
+  try {
+    try {
+      await fs.access(configPath);
+    } catch {
+      await fs.writeFile(configPath, "{}\n", { encoding: "utf8" });
+    }
+    release = await lockfile.lock(configPath, { retries: { retries: 5, minTimeout: 50, factor: 2 } });
+
+    const existing = (await readJsonIfExists(configPath)) ?? {};
+    const next: AnyRecord = { ...existing };
+    if (!next["$schema"]) next["$schema"] = "https://opencode.ai/config.json";
+
+    const providerRoot = (next["provider"] && typeof next["provider"] === "object" && !Array.isArray(next["provider"])
+      ? (next["provider"] as AnyRecord)
+      : {}) as AnyRecord;
+    const previous = (providerRoot[providerId] && typeof providerRoot[providerId] === "object"
+      ? (providerRoot[providerId] as AnyRecord)
+      : undefined);
+
+    const previousOptions =
+      (previous?.["options"] && typeof previous["options"] === "object" && !Array.isArray(previous["options"])
+        ? (previous["options"] as AnyRecord)
+        : {}) as AnyRecord;
+
+    // Compose the next options. We always overwrite baseURL and the
+    // Authorization header so re-runs converge on the latest local server,
+    // but we keep any other options the user added (e.g. timeouts).
+    const nextOptions: AnyRecord = { ...previousOptions, baseURL: input.baseURL };
+    const previousHeaders =
+      (previousOptions["headers"] && typeof previousOptions["headers"] === "object" && !Array.isArray(previousOptions["headers"])
+        ? (previousOptions["headers"] as AnyRecord)
+        : {}) as AnyRecord;
+    nextOptions["headers"] = { ...previousHeaders, Authorization: `Bearer ${input.bearerToken}` };
+
+    const previousModels =
+      (previous?.["models"] && typeof previous["models"] === "object" && !Array.isArray(previous["models"])
+        ? (previous["models"] as AnyRecord)
+        : {}) as AnyRecord;
+    const mergedModels: AnyRecord = { ...previousModels };
+    for (const m of KIRO_MODEL_CATALOG) {
+      if (!mergedModels[m.id]) mergedModels[m.id] = { name: m.displayName };
+    }
+
+    const merged: AnyRecord = {
+      ...previous,
+      npm: previous?.["npm"] ?? "@ai-sdk/openai-compatible",
+      name: previous?.["name"] ?? "Kiro",
+      options: nextOptions,
+      models: mergedModels,
+    };
+
+    next["provider"] = { ...providerRoot, [providerId]: merged };
+
+    const changed = JSON.stringify(existing) !== JSON.stringify(next);
+    if (changed) {
+      const tmp = `${configPath}.tmp-${process.pid}-${Date.now()}`;
+      await fs.writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8" });
+      await fs.rename(tmp, configPath);
+      log.info("opencode.json provider synced to local server", { configPath, providerId });
+    }
+    return { configPath, changed };
+  } finally {
+    if (release) {
+      try {
+        await release();
+      } catch (err) {
+        log.warn("Releasing opencode.json lock failed (sync)", { error: String(err) });
+      }
+    }
+  }
+}

@@ -1,6 +1,6 @@
 {
   "name": "opencode-kiro-plugin",
-  "version": "0.1.1",
+  "version": "0.1.7",
   "description": "Use Kiro models from Opencode via in-process kiro-cli acp bridge with API-key or existing CLI login auth.",
   "homepage": "https://github.com/d-init-d/opencode-kiro-plugin",
   "repository": {
@@ -28,6 +28,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./api": {
+      "types": "./dist/api.d.ts",
+      "import": "./dist/api.js"
     },
     "./package.json": "./package.json"
   },

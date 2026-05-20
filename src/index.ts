@@ -1,57 +1,25 @@
 /**
  * Public entry point for `opencode-kiro-plugin`.
  *
- * OpenCode loads the plugin by importing the package and looking for a
- * default export (or a named one configured by the user). We expose both
- * patterns: a ready-to-use `KiroPlugin` and the `createKiroPlugin` factory
- * for advanced configuration.
+ * IMPORTANT: OpenCode's plugin loader iterates all named exports of this
+ * module and treats each callable one as a plugin function. Anything that
+ * is not a plugin function (classes, schemas, types, helpers) MUST NOT be
+ * exported from here, otherwise OpenCode will try to invoke them and fail
+ * with errors like "Cannot call a class constructor without |new|".
+ *
+ * Advanced consumers (tests, scripts, integrations) should import from the
+ * `/api` subpath, which exposes the rotation/account/error-classifier API:
+ *
+ *   import { addApiKeyAccount, generateWithRotation } from "opencode-kiro-plugin/api";
  */
-export { KiroPlugin, createKiroPlugin } from "./plugin.js";
-export type { KiroPluginHooks, KiroPluginOptions } from "./plugin.js";
+import { KiroPlugin as _KiroPlugin, createKiroPlugin as _createKiroPlugin } from "./plugin.js";
 
-export {
-  DEFAULT_PROVIDER_ID,
-  SYNTHETIC_BASE_URL,
-  PLUGIN_PACKAGE_NAME,
-  KIRO_MODEL_CATALOG,
-} from "./constants.js";
+// Default export: the plugin function OpenCode invokes.
+export default _KiroPlugin;
 
-export { handleOpenAICompatibleRequest } from "./openai/handler.js";
-export { mergeOpenCodeConfig, defaultOpenCodeConfigPath } from "./config/opencode-config.js";
-export { buildStatusReport } from "./plugin/status.js";
+// Named `KiroPlugin` export: same value, supports `import { KiroPlugin }`.
+export const KiroPlugin = _KiroPlugin;
 
-// Multi-account / rotation surface — useful for advanced users wiring custom
-// front-ends, scripts, or tests.
-export {
-  addApiKeyAccount,
-  ensureCliLoginAccount,
-  loadAccountStore,
-  publicView,
-  removeAccount,
-  saveAccountStore,
-  setAccountEnabled,
-  setStrategy,
-  getAccountsFilePath,
-} from "./auth/account-store.js";
-export type {
-  AccountStore,
-  AccountStrategy,
-  AccountType,
-  KiroAccount,
-  PublicAccountView,
-  AccountRuntimeState,
-} from "./auth/account-store.js";
-export {
-  generateWithRotation,
-  streamWithRotation,
-  AllAccountsExhaustedError,
-  NoAccountsConfiguredError,
-} from "./auth/rotator.js";
-export type { RotationAttempt } from "./auth/rotator.js";
-export { classifyKiroError, isRetryable } from "./auth/error-classifier.js";
-export type { KiroErrorKind, ClassifiedError } from "./auth/error-classifier.js";
-export { pickAccount, planCooldown, timeUntilNextAvailable } from "./auth/rotation.js";
-
-// Default export = the plugin function for opencode.json `plugin` arrays.
-import { KiroPlugin } from "./plugin.js";
-export default KiroPlugin;
+// Factory: returns a plugin function. Safe because the result is callable
+// the same way OpenCode expects.
+export const createKiroPlugin = _createKiroPlugin;
