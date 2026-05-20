@@ -45,7 +45,7 @@ export interface KiroPluginResult {
   event?: (payload: KiroPluginEventPayload) => void | Promise<void>;
 }
 
-const PKG_VERSION = "0.1.1";
+const PKG_VERSION = "1.0.0";
 
 /**
  * Factory that returns the plugin function. Exposing both the factory and
