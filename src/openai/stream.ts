@@ -134,8 +134,35 @@ export function toOpenAiSseStream(args: ToOpenAiStreamArgs): ReadableStream<Uint
           switch (part.type) {
             case "text-start":
             case "text-end":
+            case "stream-start":
               // Marker only; no SSE delta.
               break;
+            case "reasoning-start": {
+              // Begin a reasoning/thinking block. Emit role if not yet sent.
+              startIfNeeded();
+              break;
+            }
+            case "reasoning-delta": {
+              // Kiro thinking content — emit as `reasoning_content` in the delta
+              // so OpenCode TUI renders it as italic "Thought: ..." block.
+              const reasoningText = part.delta ?? "";
+              if (!reasoningText) break;
+              startIfNeeded();
+              const reasoningChunk: ChatCompletionStreamChunk = {
+                ...baseChunk,
+                choices: [{
+                  index: 0,
+                  delta: { reasoning_content: reasoningText } as Record<string, unknown> as ChatCompletionStreamChunk["choices"][number]["delta"],
+                  finish_reason: null,
+                }],
+              };
+              controller.enqueue(sseLine(reasoningChunk));
+              break;
+            }
+            case "reasoning-end": {
+              // End of reasoning block — no explicit SSE event needed.
+              break;
+            }
             case "text-delta": {
               const delta = part.delta ?? part.text ?? "";
               if (!delta) break;

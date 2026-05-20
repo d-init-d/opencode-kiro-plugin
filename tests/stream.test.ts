@@ -90,6 +90,45 @@ describe("toOpenAiSseStream", () => {
     expect(headerEvent.choices[0]?.delta.tool_calls?.[0]?.function?.arguments).toBe('{"q":"vn"}');
   });
 
+  it("emits reasoning_content deltas for reasoning-start/delta/end parts", async () => {
+    const stream = toOpenAiSseStream({
+      id: "chatcmpl-reason",
+      model: "claude-opus-4.6",
+      source: fromArray([
+        { type: "stream-start" } as AiStreamPart,
+        { type: "reasoning-start", id: "r1" },
+        { type: "reasoning-delta", id: "r1", delta: "Let me think..." },
+        { type: "reasoning-delta", id: "r1", delta: " about this." },
+        { type: "reasoning-end", id: "r1" },
+        { type: "text-start", id: "t1" },
+        { type: "text-delta", id: "t1", delta: "Here is my answer." },
+        { type: "text-end", id: "t1" },
+        { type: "finish", finishReason: "stop" },
+      ]),
+    });
+    const events = parseSse(await collect(stream));
+    // Find reasoning_content deltas
+    const reasoningEvents = events.filter((e) => {
+      if (e === "DONE" || typeof e !== "object") return false;
+      const obj = e as { choices?: Array<{ delta?: { reasoning_content?: string } }> };
+      return obj.choices?.[0]?.delta?.reasoning_content !== undefined;
+    });
+    expect(reasoningEvents.length).toBe(2);
+    const first = reasoningEvents[0] as { choices: Array<{ delta: { reasoning_content: string } }> };
+    expect(first.choices[0]?.delta.reasoning_content).toBe("Let me think...");
+    const second = reasoningEvents[1] as { choices: Array<{ delta: { reasoning_content: string } }> };
+    expect(second.choices[0]?.delta.reasoning_content).toBe(" about this.");
+    // Also verify text content comes after
+    const textEvents = events.filter((e) => {
+      if (e === "DONE" || typeof e !== "object") return false;
+      const obj = e as { choices?: Array<{ delta?: { content?: string } }> };
+      return obj.choices?.[0]?.delta?.content !== undefined;
+    });
+    expect(textEvents.length).toBe(1);
+    const textEvt = textEvents[0] as { choices: Array<{ delta: { content: string } }> };
+    expect(textEvt.choices[0]?.delta.content).toBe("Here is my answer.");
+  });
+
   it("turns errors into a final stop chunk and DONE", async () => {
     const stream = toOpenAiSseStream({
       id: "chatcmpl-4",
