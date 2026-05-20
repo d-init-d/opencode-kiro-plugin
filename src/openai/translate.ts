@@ -95,6 +95,34 @@ export interface AiCallOptions {
     | { type: "json"; schema?: Record<string, unknown> };
 }
 
+// ---------- Thinking mode injection ----------
+
+const THINKING_TAG = "<thinking_mode>enabled</thinking_mode>";
+const THINKING_BUDGET_TAG = "<max_thinking_length>16000</max_thinking_length>";
+const THINKING_PREFIX = `${THINKING_TAG}\n${THINKING_BUDGET_TAG}`;
+
+/**
+ * Inject `<thinking_mode>enabled</thinking_mode>` into the first system message
+ * so Kiro's upstream service emits `agent_thought_chunk` events. If no system
+ * message exists, prepend one. If the tag is already present (e.g. user added
+ * it manually), skip injection.
+ */
+function injectThinkingMode(prompt: AiPromptMessage[]): void {
+  // Check if already present anywhere in the prompt.
+  for (const msg of prompt) {
+    if (msg.role === "system" && msg.content.includes("<thinking_mode>")) return;
+  }
+  // Find first system message and prepend.
+  for (const msg of prompt) {
+    if (msg.role === "system") {
+      (msg as AiSystemMessage).content = `${THINKING_PREFIX}\n\n${msg.content}`;
+      return;
+    }
+  }
+  // No system message — insert one at the beginning.
+  prompt.unshift({ role: "system", content: THINKING_PREFIX });
+}
+
 // ---------- OpenAI -> AI SDK ----------
 
 function textOnly(content: string | Array<{ type: "text"; text: string }>): string {
@@ -262,8 +290,16 @@ export function toolChoiceToAi(choice: ToolChoice | undefined): AiToolChoice | u
 
 export function requestToCallOptions(req: ChatCompletionRequest): AiCallOptions {
   const stopSequences = req.stop === undefined ? undefined : Array.isArray(req.stop) ? req.stop : [req.stop];
+
+  // Inject thinking mode into the prompt so Kiro emits reasoning events.
+  // This mirrors what 9router and kiro-gateway do: prepend the magic XML tag
+  // to the system message so the upstream CodeWhisperer service enables
+  // interleaved thinking output.
+  const prompt = messagesToPrompt(req.messages);
+  injectThinkingMode(prompt);
+
   const opts: AiCallOptions = {
-    prompt: messagesToPrompt(req.messages),
+    prompt,
   };
   const tools = toolsToAi(req.tools);
   if (tools) opts.tools = tools;

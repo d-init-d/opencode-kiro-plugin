@@ -90,7 +90,7 @@ describe("toOpenAiSseStream", () => {
     expect(headerEvent.choices[0]?.delta.tool_calls?.[0]?.function?.arguments).toBe('{"q":"vn"}');
   });
 
-  it("emits reasoning_content deltas for reasoning-start/delta/end parts", async () => {
+  it("emits reasoning as inline italic content for OpenCode 1.2.x compatibility", async () => {
     const stream = toOpenAiSseStream({
       id: "chatcmpl-reason",
       model: "claude-opus-4.6",
@@ -107,26 +107,22 @@ describe("toOpenAiSseStream", () => {
       ]),
     });
     const events = parseSse(await collect(stream));
-    // Find reasoning_content deltas
-    const reasoningEvents = events.filter((e) => {
-      if (e === "DONE" || typeof e !== "object") return false;
-      const obj = e as { choices?: Array<{ delta?: { reasoning_content?: string } }> };
-      return obj.choices?.[0]?.delta?.reasoning_content !== undefined;
-    });
-    expect(reasoningEvents.length).toBe(2);
-    const first = reasoningEvents[0] as { choices: Array<{ delta: { reasoning_content: string } }> };
-    expect(first.choices[0]?.delta.reasoning_content).toBe("Let me think...");
-    const second = reasoningEvents[1] as { choices: Array<{ delta: { reasoning_content: string } }> };
-    expect(second.choices[0]?.delta.reasoning_content).toBe(" about this.");
-    // Also verify text content comes after
-    const textEvents = events.filter((e) => {
-      if (e === "DONE" || typeof e !== "object") return false;
+    // Collect all content deltas
+    const contentParts: string[] = [];
+    for (const e of events) {
+      if (e === "DONE" || typeof e !== "object") continue;
       const obj = e as { choices?: Array<{ delta?: { content?: string } }> };
-      return obj.choices?.[0]?.delta?.content !== undefined;
-    });
-    expect(textEvents.length).toBe(1);
-    const textEvt = textEvents[0] as { choices: Array<{ delta: { content: string } }> };
-    expect(textEvt.choices[0]?.delta.content).toBe("Here is my answer.");
+      const c = obj.choices?.[0]?.delta?.content;
+      if (c !== undefined) contentParts.push(c);
+    }
+    const fullContent = contentParts.join("");
+    // Should contain italic thinking block followed by actual answer
+    expect(fullContent).toContain("*Thought: Let me think... about this.*");
+    expect(fullContent).toContain("Here is my answer.");
+    // Thinking comes before the answer
+    const thinkIdx = fullContent.indexOf("*Thought:");
+    const answerIdx = fullContent.indexOf("Here is my answer.");
+    expect(thinkIdx).toBeLessThan(answerIdx);
   });
 
   it("turns errors into a final stop chunk and DONE", async () => {

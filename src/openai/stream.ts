@@ -138,13 +138,25 @@ export function toOpenAiSseStream(args: ToOpenAiStreamArgs): ReadableStream<Uint
               // Marker only; no SSE delta.
               break;
             case "reasoning-start": {
-              // Begin a reasoning/thinking block. Emit role if not yet sent.
+              // Begin a reasoning/thinking block. Emit role if not yet sent,
+              // then start the italic markdown prefix so older OpenCode versions
+              // (1.2.x) that don't understand reasoning_content still see it.
               startIfNeeded();
+              const startChunk: ChatCompletionStreamChunk = {
+                ...baseChunk,
+                choices: [{
+                  index: 0,
+                  delta: { content: "\n*Thought: " },
+                  finish_reason: null,
+                }],
+              };
+              controller.enqueue(sseLine(startChunk));
               break;
             }
             case "reasoning-delta": {
-              // Kiro thinking content — emit as `reasoning_content` in the delta
-              // so OpenCode TUI renders it as italic "Thought: ..." block.
+              // Kiro thinking content — emit as plain content (italic markdown)
+              // for compatibility with OpenCode 1.2.x which doesn't render
+              // reasoning_content. Newer versions will still show it inline.
               const reasoningText = part.delta ?? "";
               if (!reasoningText) break;
               startIfNeeded();
@@ -152,7 +164,7 @@ export function toOpenAiSseStream(args: ToOpenAiStreamArgs): ReadableStream<Uint
                 ...baseChunk,
                 choices: [{
                   index: 0,
-                  delta: { reasoning_content: reasoningText } as Record<string, unknown> as ChatCompletionStreamChunk["choices"][number]["delta"],
+                  delta: { content: reasoningText },
                   finish_reason: null,
                 }],
               };
@@ -160,7 +172,17 @@ export function toOpenAiSseStream(args: ToOpenAiStreamArgs): ReadableStream<Uint
               break;
             }
             case "reasoning-end": {
-              // End of reasoning block — no explicit SSE event needed.
+              // Close the italic markdown block with a newline separator.
+              startIfNeeded();
+              const endChunk: ChatCompletionStreamChunk = {
+                ...baseChunk,
+                choices: [{
+                  index: 0,
+                  delta: { content: "*\n\n" },
+                  finish_reason: null,
+                }],
+              };
+              controller.enqueue(sseLine(endChunk));
               break;
             }
             case "text-delta": {
